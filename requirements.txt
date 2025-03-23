@@ -1,0 +1,12 @@
+torch
+torchvision
+numpy
+scipy
+pillow
+numpy
+pandas
+matplotlib
+scikit-learn
+scikit-image
+tqdm
+fire

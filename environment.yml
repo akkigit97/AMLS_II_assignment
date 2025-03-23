@@ -1,0 +1,9 @@
+name: amls_proj2
+channels:
+  - conda
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -r requirements.txt
