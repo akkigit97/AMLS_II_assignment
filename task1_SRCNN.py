@@ -1,4 +1,6 @@
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,14 +9,16 @@ from torchvision import transforms
 from PIL import Image
 from math import log10
 import numpy as np
+import matplotlib.pyplot as plt  # For plotting graphs
 
 #####################
 # Folder Paths
 #####################
-TRAIN_LR_PATH = "DIV2K/DIV2K_train_LR_bicubic_X4"
-TRAIN_HR_PATH = "DIV2K/DIV2K_train_HR"
-VALID_LR_PATH = "DIV2K/DIV2K_valid_LR_bicubic_X4"
-VALID_HR_PATH = "DIV2K/DIV2K_valid_HR"
+TRAIN_LR_PATH = "/home/uceeaat/AMLS_II_assignment/DIV2K/DIV2K_train_LR_bicubic_X4/DIV2K_train_LR_bicubic/X4"
+TRAIN_HR_PATH = "/home/uceeaat/AMLS_II_assignment/DIV2K/DIV2K_train_HR"
+VALID_LR_PATH = "/home/uceeaat/AMLS_II_assignment/DIV2K/DIV2K_valid_LR_bicubic_X4/DIV2K_valid_LR_bicubic/X4"
+VALID_HR_PATH = "/home/uceeaat/AMLS_II_assignment/DIV2K/DIV2K_valid_HR"
+
 
 #####################
 # Dataset
@@ -27,8 +31,13 @@ class DIV2KDataset(Dataset):
     def __init__(self, lr_dir, hr_dir, transform=None):
         self.lr_dir = lr_dir
         self.hr_dir = hr_dir
-        self.lr_files = sorted(os.listdir(lr_dir))
-        self.hr_files = sorted(os.listdir(hr_dir))
+        # Filter only valid image files (adjust extensions as needed)
+        self.lr_files = [f for f in sorted(os.listdir(lr_dir))
+                         if f.lower().endswith(('.png', '.jpg', '.jpeg')) and
+                         os.path.isfile(os.path.join(lr_dir, f))]
+        self.hr_files = [f for f in sorted(os.listdir(hr_dir))
+                         if f.lower().endswith(('.png', '.jpg', '.jpeg')) and
+                         os.path.isfile(os.path.join(hr_dir, f))]
         self.transform = transform
 
     def __len__(self):
@@ -86,8 +95,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
-    # 2. Create datasets & loaders
-    transform = transforms.ToTensor()  # Basic transform to get [0,1] range Tensors
+    # 2. Create datasets & loaders with a joint transform (center crop)
+    crop_size = 256  # Adjust as needed
+    transform = transforms.Compose([
+        transforms.CenterCrop(crop_size),
+        transforms.ToTensor()
+    ])
+
     train_dataset = DIV2KDataset(TRAIN_LR_PATH, TRAIN_HR_PATH, transform=transform)
     valid_dataset = DIV2KDataset(VALID_LR_PATH, VALID_HR_PATH, transform=transform)
 
@@ -102,8 +116,12 @@ def main():
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
+    # Lists to store metrics for plotting later
+    train_losses = []
+    val_psnrs = []
+
     # 4. Train
-    num_epochs = 2  # Increase for real training (e.g., 50+ epochs)
+    num_epochs = 50  # Increase for real training (e.g., 50+ epochs)
     for epoch in range(num_epochs):
         model.train()
         total_loss = 0
@@ -120,6 +138,7 @@ def main():
             total_loss += loss.item()
 
         avg_loss = total_loss / len(train_loader)
+        train_losses.append(avg_loss)
         print(f"[Epoch {epoch+1}/{num_epochs}] Training Loss: {avg_loss:.4f}")
 
         # 5. Validate
@@ -132,11 +151,35 @@ def main():
                 val_psnr += calculate_psnr(sr_imgs, hr_imgs)
 
         avg_psnr = val_psnr / len(valid_loader)
+        val_psnrs.append(avg_psnr)
         print(f"[Epoch {epoch+1}/{num_epochs}] Validation PSNR: {avg_psnr:.2f} dB\n")
 
     # 6. (Optional) Save the model
     torch.save(model.state_dict(), "srcnn_bicubic_x4.pth")
     print("Training complete. Model saved to srcnn_bicubic_x4.pth")
+
+    # 7. Plot the performance graphs
+    epochs = range(1, num_epochs + 1)
+
+    plt.figure(figsize=(12, 5))
+    
+    # Plot Training Loss
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_losses, marker='o', linestyle='-')
+    plt.title("Training Loss over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    
+    # Plot Validation PSNR
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, val_psnrs, marker='o', linestyle='-')
+    plt.title("Validation PSNR over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("PSNR (dB)")
+    
+    plt.tight_layout()
+    plt.savefig("training_performance.png")  # Save the plot to a file
+    plt.show()
 
 if __name__ == "__main__":
     main()

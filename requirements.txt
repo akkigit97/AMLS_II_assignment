@@ -8,5 +8,4 @@ pandas
 matplotlib
 scikit-learn
 scikit-image
-tqdm
 fire
