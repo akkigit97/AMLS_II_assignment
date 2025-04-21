@@ -31,6 +31,7 @@ from PIL import Image, ImageFilter
 from torchvision import models
 from torchvision.models import vgg19
 from tqdm import tqdm
+from contextlib import nullcontext
 
 # Import torch.cuda.amp module as amp
 import torch.cuda.amp as amp
@@ -694,48 +695,33 @@ class CBAM(nn.Module):
 class ImprovedResidualBlock(nn.Module):
     def __init__(self, channels):
         super(ImprovedResidualBlock, self).__init__()
-        # Use adaptive normalization
+        
+        # Simplified block with batch normalization for stability
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.norm1 = AdaptiveNorm(channels)
-        self.prelu1 = nn.PReLU()
-        
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.activation = nn.ReLU(inplace=True)  # Use ReLU instead of PReLU for stability
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.norm2 = AdaptiveNorm(channels)
+        self.bn2 = nn.BatchNorm2d(channels)
         
-        # Simplified attention mechanism
-        self.se = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(channels, channels // 4, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // 4, channels, 1),
-            nn.Sigmoid()
-        )
+        # Initialize with small values
+        self._initialize_weights()
         
-        # Residual scaling factor - start with smaller value to prevent instability
-        self.scale = nn.Parameter(torch.FloatTensor([0.1]))
-        self.dropout = nn.Dropout(0.1)
-
+    def _initialize_weights(self):
+        nn.init.kaiming_normal_(self.conv1.weight, a=0, mode='fan_in', nonlinearity='relu')
+        nn.init.kaiming_normal_(self.conv2.weight, a=0, mode='fan_in', nonlinearity='relu')
+        nn.init.constant_(self.conv1.bias, 0)
+        nn.init.constant_(self.conv2.bias, 0)
+        
     def forward(self, x):
-        identity = x
-        
-        # Main branch with proper normalization order
         out = self.conv1(x)
-        out = self.norm1(out)
-        out = self.prelu1(out)
+        out = self.bn1(out)
+        out = self.activation(out)
         
         out = self.conv2(out)
-        out = self.norm2(out)
+        out = self.bn2(out)
         
-        # Apply attention and dropout
-        out = out * self.se(out)
-        out = self.dropout(out)
-        
-        # Check for NaN before adding residual
-        if torch.isnan(out).any() or torch.isinf(out).any():
-            return identity
-        
-        # Scaled residual connection
-        return identity + self.scale * out
+        # Explicitly avoid in-place addition to prevent numerical issues
+        return out
 
 class ResidualDenseBlock(nn.Module):
     """Residual Dense Block with Channel Attention for better feature extraction"""
@@ -856,80 +842,90 @@ class ImprovedGenerator(nn.Module):
     def __init__(self, in_channels=3, out_channels=3, num_channels=64, num_blocks=16, upscale_factor=4):
         super(ImprovedGenerator, self).__init__()
         
-        self.conv1 = nn.Conv2d(in_channels, num_channels, kernel_size=9, padding=4)
-        self.prelu1 = nn.PReLU()
+        # Use a more stable architecture with fewer blocks for initial training
+        num_blocks = min(num_blocks, 8)  # Limit block count to reduce complexity initially
         
-        # Residual blocks
-        self.res_blocks = nn.ModuleList()
-        for _ in range(num_blocks):
-            self.res_blocks.append(RRDB(num_channels))
-            
-        # Second conv layer after residual blocks
-        self.conv2 = nn.Conv2d(num_channels, num_channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(num_channels)
+        # Define model layers
+        # Initial convolution block with lower channel count
+        self.conv_input = nn.Conv2d(in_channels, num_channels, kernel_size=3, stride=1, padding=1)
         
-        # Upsampling layers
-        upsampling = []
-        for _ in range(int(math.log2(upscale_factor))):
-            upsampling.extend([
-                nn.Conv2d(num_channels, num_channels * 4, kernel_size=3, padding=1),
+        # Residual blocks with activation scaling
+        self.residual_blocks = nn.ModuleList([
+            ImprovedResidualBlock(num_channels) for _ in range(num_blocks)
+        ])
+        
+        # Skip connection with batch norm for stability
+        self.conv_mid = nn.Sequential(
+            nn.Conv2d(num_channels, num_channels, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(num_channels)
+        )
+        
+        # Upsampling blocks with batch norm
+        if upscale_factor == 4:
+            self.upsampling = nn.Sequential(
+                nn.Conv2d(num_channels, num_channels * 4, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm2d(num_channels * 4),
+                nn.PixelShuffle(2),
+                nn.PReLU(),
+                nn.Conv2d(num_channels, num_channels * 4, kernel_size=3, stride=1, padding=1),
+                nn.BatchNorm2d(num_channels * 4),
                 nn.PixelShuffle(2),
                 nn.PReLU()
-            ])
-        self.upsampling = nn.Sequential(*upsampling)
+            )
+        else:
+            # Simplified for now - add more options as needed
+            raise ValueError(f"Upscale factor {upscale_factor} not supported")
+            
+        # Final output layer with small initialization
+        self.conv_output = nn.Conv2d(num_channels, out_channels, kernel_size=3, stride=1, padding=1)
         
-        # Add a final smoothing layer with smaller kernel to reduce artifacts
-        self.conv3 = nn.Conv2d(num_channels, out_channels, kernel_size=3, padding=1)
-        
-        # Add a residual intensity control parameter - reduced from 0.8 to 0.6
-        self.residual_beta = nn.Parameter(torch.tensor(0.6))
-        
-        # Increase smoothing factor to reduce high-frequency noise
-        self.smoothing_factor = nn.Parameter(torch.tensor(0.25))
-        
-        # Initialize weights with a conservative approach
+        # Careful initialization
         self._initialize_weights()
+        
+        # Scaling factor for stability
+        self.residual_scale = 0.1
         
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
-                m.weight.data *= 0.1  # Scale down weights to reduce artifacts
+                # Use smaller standard deviation for initialization
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
-                nn.init.normal_(m.weight.data, 1.0, 0.02)
-                nn.init.constant_(m.bias.data, 0.0)
-    
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+        
+        # Initialize the final layer with smaller weights for stability
+        nn.init.normal_(self.conv_output.weight, std=0.001)
+        nn.init.constant_(self.conv_output.bias, 0)
+        
     def forward(self, x):
+        # Add check for NaN inputs
+        if torch.isnan(x).any():
+            print("Warning: NaN detected in generator input")
+            x = torch.nan_to_num(x, nan=0.0)
+        
         # Store input for residual connection
-        input_img = x
+        out1 = self.conv_input(x)
         
-        # Initial convolution
-        out = self.prelu1(self.conv1(x))
-        skip = out
+        # Process through residual blocks with scaling factor
+        out = out1.clone()
+        for block in self.residual_blocks:
+            out = out + self.residual_scale * block(out)  # Scale residual to prevent overflow
         
-        # Apply residual blocks with controlled intensity
-        for res_block in self.res_blocks:
-            out = res_block(out)
-        
-        # Second convolution and skip connection
-        out = self.bn2(self.conv2(out))
-        out = out + self.residual_beta * skip  # Controlled skip connection to maintain overall structure
+        # Skip connection
+        out = self.conv_mid(out)
+        out = out + out1
         
         # Upsampling
         out = self.upsampling(out)
         
-        # Final smoothed output
-        out = self.conv3(out)
+        # Final convolution with clipping
+        out = self.conv_output(out)
         
-        # Apply tanh activation to ensure output is in range [-1, 1]
-        # Use smoothing factor to blend with a smoother version to reduce artifacts
-        smooth_out = F.avg_pool2d(out, kernel_size=3, stride=1, padding=1)
-        out = (1 - self.smoothing_factor) * out + self.smoothing_factor * smooth_out
-        out = torch.tanh(out)
-        
-        return out
+        # Use tanh with safety clipping
+        return torch.tanh(torch.clamp(out, -10, 10))
 
 def spectral_norm(module):
     return nn.utils.spectral_norm(module)
@@ -1025,57 +1021,42 @@ class VGGLoss(nn.Module):
     def __init__(self, device):
         super(VGGLoss, self).__init__()
         
-        # Load pretrained VGG19 model
-        vgg = models.vgg19(pretrained=True).to(device)
+        # Load pretrained VGG model - use a simpler version (VGG16 instead of VGG19)
+        vgg = models.vgg16(pretrained=True).to(device)
         vgg.eval()
         
-        # Define slices of the VGG model to extract features from different layers
-        self.slice1 = nn.Sequential(*list(vgg.features)[:4]).eval()  # relu1_2
-        self.slice2 = nn.Sequential(*list(vgg.features)[4:9]).eval()  # relu2_2
-        self.slice3 = nn.Sequential(*list(vgg.features)[9:18]).eval()  # relu3_4
-        self.slice4 = nn.Sequential(*list(vgg.features)[18:27]).eval()  # relu4_4
-        self.slice5 = nn.Sequential(*list(vgg.features)[27:36]).eval()  # relu5_4
+        # Use fewer layers to reduce complexity and chance of instability
+        self.features = nn.Sequential(*list(vgg.features)[:16]).eval()
         
         # Freeze parameters
         for param in self.parameters():
             param.requires_grad = False
             
-        self.weights = [1.0/32, 1.0/16, 1.0/8, 1.0/4, 1.0]  # Weight each layer differently
-        self.criterion = nn.MSELoss()  # Use MSE instead of L1
+        # Use L1 loss - more stable than MSE for perceptual loss
+        self.criterion = nn.L1Loss()
         self.device = device
         
     def forward(self, sr, hr):
+        # Safe normalization with clipping to prevent extreme values
+        sr = torch.clamp(sr, -1.0, 1.0)
+        hr = torch.clamp(hr, -1.0, 1.0)
+        
         # Normalize inputs from [-1, 1] to [0, 1]
         sr = (sr + 1.0) / 2.0
         hr = (hr + 1.0) / 2.0
         
-        # Add VGG mean for proper normalization
-        sr = sr - torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
-        sr = sr / torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
+        # Extract features
+        sr_features = self.features(sr)
+        hr_features = self.features(hr)
         
-        hr = hr - torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
-        hr = hr / torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
+        # Compute loss
+        loss = self.criterion(sr_features, hr_features)
         
-        # Get features from multiple layers
-        sr1 = self.slice1(sr)
-        sr2 = self.slice2(sr1)
-        sr3 = self.slice3(sr2)
-        sr4 = self.slice4(sr3)
-        sr5 = self.slice5(sr4)
-        
-        hr1 = self.slice1(hr)
-        hr2 = self.slice2(hr1)
-        hr3 = self.slice3(hr2)
-        hr4 = self.slice4(hr3)
-        hr5 = self.slice5(hr4)
-        
-        # Compute weighted content loss - higher weights to early layers to preserve details
-        loss = self.weights[0] * self.criterion(sr1, hr1) + \
-               self.weights[1] * self.criterion(sr2, hr2) + \
-               self.weights[2] * self.criterion(sr3, hr3) + \
-               self.weights[3] * self.criterion(sr4, hr4) + \
-               self.weights[4] * self.criterion(sr5, hr5)
-        
+        # Check for NaN values and return zero if found (to prevent training collapse)
+        if torch.isnan(loss):
+            print("Warning: NaN detected in VGG loss, returning zero loss")
+            return torch.zeros(1, device=self.device, requires_grad=True)
+            
         return loss
 
 def calculate_psnr(sr, hr):
@@ -1384,8 +1365,9 @@ def train_unknown_srgan(use_synthetic=False, use_wandb=False, verbose=True,
         if device == 'cuda':
             print("CUDA not available, using CPU instead")
     
-    # Initialize mixed precision training
-    scaler = amp.GradScaler()
+    # Initialize mixed precision training - use the standard API without custom wrappers
+    use_amp = device.type == 'cuda'  # Only use mixed precision on CUDA
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
     
     # Initialize Weights & Biases
     if use_wandb:
@@ -1487,6 +1469,22 @@ def train_unknown_srgan(use_synthetic=False, use_wandb=False, verbose=True,
     scheduler_G = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_G, T_max=num_epochs, eta_min=1e-6)
     scheduler_D = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_D, T_max=num_epochs, eta_min=1e-6)
     
+    # Initialize optimizers with lower learning rates for stability
+    lr_gen_stable = 5e-5  # Lower learning rate
+    lr_disc_stable = 5e-5  # Lower learning rate
+    optimizer_G = torch.optim.Adam(generator.parameters(), lr=lr_gen_stable, betas=(0.9, 0.999))
+    optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=lr_disc_stable, betas=(0.9, 0.999))
+    
+    # Initialize optimizers with extremely low learning rates to fix NaN issues
+    lr_gen_stable = 1e-6  # Drastically reduced learning rate
+    lr_disc_stable = 1e-6  # Drastically reduced learning rate
+    optimizer_G = torch.optim.Adam(generator.parameters(), lr=lr_gen_stable, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-5)
+    optimizer_D = torch.optim.Adam(discriminator.parameters(), lr=lr_disc_stable, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-5)
+    
+    # Use a more gentle learning rate schedule
+    scheduler_G = torch.optim.lr_scheduler.StepLR(optimizer_G, step_size=10, gamma=0.9)
+    scheduler_D = torch.optim.lr_scheduler.StepLR(optimizer_D, step_size=10, gamma=0.9)
+    
     # Loss functions
     content_criterion = nn.L1Loss().to(device)
     adversarial_criterion = nn.BCEWithLogitsLoss().to(device)
@@ -1536,17 +1534,6 @@ def train_unknown_srgan(use_synthetic=False, use_wandb=False, verbose=True,
         epoch_disc_loss = 0.0
         batch_count = 0
         
-        # Progressive loss weights - gradually shift from content to adversarial
-        progress_ratio = min(epoch / (num_epochs * 0.7), 1.0)  # Extend transition period
-        # Emphasize content loss more to reduce artifacts
-        content_weight = 1.0 
-        # Reduce perceptual weight significantly to prevent over-sharpening
-        perceptual_weight = 0.2 * (1.0 - progress_ratio * 0.7)  
-        # Keep adversarial weight lower to prevent artifacts
-        adversarial_weight = 0.001 + progress_ratio * 0.002  # Even lower adversarial weight
-        # Optional LPIPS weight - reduced to prevent over-texturing
-        lpips_weight = 0.03 if use_lpips else 0.0
-        
         # Progressive loss weights - optimized for clearer images with fewer artifacts
         progress_ratio = min(epoch / (num_epochs * 0.5), 1.0)  # Faster transition to perceptual losses
         
@@ -1564,6 +1551,48 @@ def train_unknown_srgan(use_synthetic=False, use_wandb=False, verbose=True,
         # LPIPS weight - for additional perceptual quality if available
         lpips_weight = 0.05 * progress_ratio if use_lpips else 0.0
         
+        # Use fixed, conservative loss weights for the first few epochs to stabilize training
+        # After the initial stable period, gradually adjust weights
+        stable_period = 5  # First 5 epochs use safe weights
+        
+        if epoch < stable_period:
+            # Very conservative weights during initial stabilization
+            content_weight = 1.0      # Focus mainly on content loss for stability
+            perceptual_weight = 0.05  # Very small perceptual loss
+            adversarial_weight = 0.0  # No adversarial component
+            lpips_weight = 0.0        # No LPIPS to start
+        else:
+            # After stabilization, carefully increase weights
+            progress_ratio = min((epoch - stable_period) / (num_epochs * 0.5), 1.0)
+            content_weight = 1.0
+            perceptual_weight = 0.05 + 0.2 * progress_ratio  # Slower increase
+            adversarial_weight = 0.00005 * progress_ratio    # Very cautious
+            lpips_weight = 0.01 * progress_ratio if use_lpips else 0.0
+        
+        # Make training extremely stable at the beginning - focus only on L1 reconstruction
+        # Then slowly add other loss components
+        warmup_period = 10  # First 10 epochs for pure reconstruction
+        
+        if epoch < warmup_period:
+            # First 10 epochs: pure L1 reconstruction loss only
+            content_weight = 1.0
+            perceptual_weight = 0.0  # No perceptual loss
+            adversarial_weight = 0.0  # No adversarial component
+            lpips_weight = 0.0      # No LPIPS
+        elif epoch < warmup_period + 10:
+            # Next 10 epochs: add tiny bit of perceptual loss
+            content_weight = 1.0
+            perceptual_weight = 0.01  # Very minimal perceptual loss
+            adversarial_weight = 0.0   # Still no adversarial
+            lpips_weight = 0.0
+        else:
+            # Only after 20 epochs, start adding adversarial components very cautiously
+            progress_ratio = min((epoch - warmup_period - 10) / (num_epochs * 0.5), 1.0)
+            content_weight = 1.0
+            perceptual_weight = 0.01 + 0.04 * progress_ratio  # Slower increase
+            adversarial_weight = 0.00001 * progress_ratio     # Extremely cautious
+            lpips_weight = 0.005 * progress_ratio if use_lpips else 0.0
+        
         # Create a progress bar for better visibility
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
         
@@ -1574,6 +1603,15 @@ def train_unknown_srgan(use_synthetic=False, use_wandb=False, verbose=True,
             lr_imgs = lr_imgs.to(device)
             hr_imgs = hr_imgs.to(device)
             
+            # Check for NaN values in input before processing
+            if torch.isnan(lr_imgs).any() or torch.isnan(hr_imgs).any():
+                print("NaN values detected in input images, skipping batch")
+                continue
+                
+            # Normalize input to ensure no extreme values
+            lr_imgs = torch.clamp(lr_imgs, -1.0, 1.0)
+            hr_imgs = torch.clamp(hr_imgs, -1.0, 1.0)
+            
             # Adversarial ground truths
             valid = torch.ones((lr_imgs.size(0), 1), device=device)
             fake = torch.zeros((lr_imgs.size(0), 1), device=device)
@@ -1583,9 +1621,15 @@ def train_unknown_srgan(use_synthetic=False, use_wandb=False, verbose=True,
             #-------------------------
             optimizer_G.zero_grad()
             
-            with amp.autocast():
+            # Use standard torch.cuda.amp.autocast context manager
+            with torch.cuda.amp.autocast() if use_amp else nullcontext():
                 # Generate a high resolution image from low resolution input
                 gen_hr = generator(lr_imgs)
+                
+                # Check for NaN values in generated images
+                if torch.isnan(gen_hr).any():
+                    print("NaN values detected in generator output, skipping batch")
+                    continue
                 
                 # Adversarial loss
                 pred_real = discriminator(hr_imgs)
@@ -1635,7 +1679,7 @@ def train_unknown_srgan(use_synthetic=False, use_wandb=False, verbose=True,
             #-------------------------
             optimizer_D.zero_grad()
             
-            with amp.autocast():
+            with torch.cuda.amp.autocast() if use_amp else nullcontext():
                 # Compute discriminator outputs
                 pred_real = discriminator(hr_imgs)
                 pred_fake = discriminator(gen_hr.detach())
@@ -2096,6 +2140,15 @@ def log_images_to_wandb(generator, valid_loader, device, epoch, use_wandb):
                         from torchvision.transforms.functional import resize
                         sample_sr = resize(sample_lr, size=sample_hr.shape[2:], 
                                            mode='bicubic', antialias=True)
+
+                        # Use bicubic upsampling as emergency fallback
+                        # Use a more compatible interpolation method
+                        sample_sr = torch.nn.functional.interpolate(
+                            sample_lr, 
+                            size=sample_hr.shape[2:], 
+                            mode='bicubic', 
+                            align_corners=False
+                        )
                 except Exception as e:
                     print(f"Error generating SR image: {e}")
                     # Use bicubic upsampling as emergency fallback
