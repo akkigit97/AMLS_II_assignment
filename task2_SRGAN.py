@@ -935,60 +935,60 @@ def spectral_norm(module):
     return nn.utils.spectral_norm(module)
 
 class ImprovedDiscriminator(nn.Module):
-    """Modified Discriminator with reduced aggressiveness"""
     def __init__(self, input_shape):
         super(ImprovedDiscriminator, self).__init__()
         
-        def discriminator_block(in_filters, out_filters, first_block=False):
-            """Returns a sequence of operations"""
+        def discriminator_block(in_filters, out_filters, normalization=True, stride=2):
+            """Returns layers of each discriminator block"""
             layers = []
-            # Use stride 1 for the first block to preserve more information
-            stride = 1 if first_block else 2
-            
-            # Add convolutional layer
             layers.append(spectral_norm(nn.Conv2d(
                 in_filters, 
                 out_filters, 
-                kernel_size=4, 
+                kernel_size=3, 
                 stride=stride, 
-                padding=1, 
-                bias=False)))
-            
-            # No batch norm in first layer
-            if not first_block:
+                padding=1
+            )))
+            if normalization:
                 layers.append(nn.BatchNorm2d(out_filters))
-            
-            # Use smoother LeakyReLU
-            layers.append(nn.LeakyReLU(0.1, inplace=True))
-            
-            # Add dropout for regularization
-            if not first_block:
-                layers.append(nn.Dropout2d(0.2))
-            
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
             return layers
         
-        # Get shape of input
+        self.input_shape = input_shape
         channels, height, width = input_shape
         
-        # Modified size progression with smaller jumps
-        self.model = nn.Sequential(
-            *discriminator_block(channels, 32, first_block=True),
-            *discriminator_block(32, 64),
+        # More gradual downsampling with more blocks and smaller stride
+        self.models = nn.Sequential(
+            # First block - no normalization
+            *discriminator_block(channels, 64, normalization=False, stride=1),
+            # Use spectral norm and batch norm with moderate feature growth
             *discriminator_block(64, 128),
             *discriminator_block(128, 256),
-            # Use average pooling instead of strided convolutions for the final layers
+            *discriminator_block(256, 512),
+            *discriminator_block(512, 512),
+            
+            # Global average pooling
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(256, 1)
+            # Final projection
+            spectral_norm(nn.Linear(512, 1))
         )
+        
+        # Initialize weights
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight, a=0.2)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
     
     def forward(self, img):
-        # Add noise to input to stabilize training
+        # Add mild noise during training for stability
         if self.training:
-            noise = torch.randn_like(img) * 0.1
+            noise = torch.randn_like(img) * 0.05
             img = img + noise
         
-        return self.model(img)
+        return self.models(img)
 
 # Gradient penalty for WGAN-GP
 def compute_gradient_penalty(D, real_samples, fake_samples):
@@ -1024,52 +1024,59 @@ class EMA:
 class VGGLoss(nn.Module):
     def __init__(self, device):
         super(VGGLoss, self).__init__()
-        # Use pretrained VGG19 model
+        
+        # Load pretrained VGG19 model
         vgg = models.vgg19(pretrained=True).to(device)
         vgg.eval()
         
+        # Define slices of the VGG model to extract features from different layers
+        self.slice1 = nn.Sequential(*list(vgg.features)[:4]).eval()  # relu1_2
+        self.slice2 = nn.Sequential(*list(vgg.features)[4:9]).eval()  # relu2_2
+        self.slice3 = nn.Sequential(*list(vgg.features)[9:18]).eval()  # relu3_4
+        self.slice4 = nn.Sequential(*list(vgg.features)[18:27]).eval()  # relu4_4
+        self.slice5 = nn.Sequential(*list(vgg.features)[27:36]).eval()  # relu5_4
+        
         # Freeze parameters
-        for param in vgg.parameters():
+        for param in self.parameters():
             param.requires_grad = False
+            
+        self.weights = [1.0/32, 1.0/16, 1.0/8, 1.0/4, 1.0]  # Weight each layer differently
+        self.criterion = nn.MSELoss()  # Use MSE instead of L1
+        self.device = device
         
-        # Modified feature extraction - use more balanced set of features from multiple layers
-        self.features_1 = nn.Sequential(*list(vgg.features.children())[:2]).to(device)  # First layer - detect basic structures
-        self.features_2 = nn.Sequential(*list(vgg.features.children())[:7]).to(device)  # Lower layer - detect textures
-        self.features_3 = nn.Sequential(*list(vgg.features.children())[:16]).to(device) # Middle layer - detect patterns
-        self.features_4 = nn.Sequential(*list(vgg.features.children())[:25]).to(device) # Higher layer - detect semantics
-        
-        # Use MSE loss
-        self.criterion = nn.MSELoss()
-        
-        # Add a weight for each layer to balance their contributions
-        self.weights = [1.0/32, 1.0/16, 1.0/8, 1.0/4]
-    
     def forward(self, sr, hr):
-        # Normalize inputs
-        sr = (sr + 1.0) / 2.0  # Scale from [-1, 1] to [0, 1]
+        # Normalize inputs from [-1, 1] to [0, 1]
+        sr = (sr + 1.0) / 2.0
         hr = (hr + 1.0) / 2.0
         
-        # Extract features from different layers
-        sr_f1 = self.features_1(sr)
-        hr_f1 = self.features_1(hr)
+        # Add VGG mean for proper normalization
+        sr = sr - torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
+        sr = sr / torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
         
-        sr_f2 = self.features_2(sr)
-        hr_f2 = self.features_2(hr)
+        hr = hr - torch.Tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(self.device)
+        hr = hr / torch.Tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(self.device)
         
-        sr_f3 = self.features_3(sr)
-        hr_f3 = self.features_3(hr)
+        # Get features from multiple layers
+        sr1 = self.slice1(sr)
+        sr2 = self.slice2(sr1)
+        sr3 = self.slice3(sr2)
+        sr4 = self.slice4(sr3)
+        sr5 = self.slice5(sr4)
         
-        sr_f4 = self.features_4(sr)
-        hr_f4 = self.features_4(hr)
+        hr1 = self.slice1(hr)
+        hr2 = self.slice2(hr1)
+        hr3 = self.slice3(hr2)
+        hr4 = self.slice4(hr3)
+        hr5 = self.slice5(hr4)
         
-        # Calculate losses from different layers with weights
-        loss1 = self.criterion(sr_f1, hr_f1) * self.weights[0]
-        loss2 = self.criterion(sr_f2, hr_f2) * self.weights[1]
-        loss3 = self.criterion(sr_f3, hr_f3) * self.weights[2]
-        loss4 = self.criterion(sr_f4, hr_f4) * self.weights[3]
+        # Compute weighted content loss - higher weights to early layers to preserve details
+        loss = self.weights[0] * self.criterion(sr1, hr1) + \
+               self.weights[1] * self.criterion(sr2, hr2) + \
+               self.weights[2] * self.criterion(sr3, hr3) + \
+               self.weights[3] * self.criterion(sr4, hr4) + \
+               self.weights[4] * self.criterion(sr5, hr5)
         
-        # Return weighted sum of losses, emphasizing structure over high-frequency details
-        return loss1 + loss2 + loss3 + loss4
+        return loss
 
 def calculate_psnr(sr, hr):
     """Calculate PSNR between super-resolved and high-resolution images"""
@@ -1451,6 +1458,20 @@ def train_unknown_srgan(use_synthetic=False, use_wandb=False, verbose=True,
     generator = ImprovedGenerator(in_channels=3, out_channels=3, num_channels=64, num_blocks=16, upscale_factor=4).to(device)
     discriminator = ImprovedDiscriminator(input_shape=(3, 96, 96)).to(device)
     
+    # Initialize models with proper initialization
+    generator = ImprovedGenerator(in_channels=3, out_channels=3, num_channels=64, num_blocks=16, upscale_factor=4).to(device)
+    # Apply improved weight initialization to generator
+    for m in generator.modules():
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
+    
+    discriminator = ImprovedDiscriminator(input_shape=(3, 96, 96)).to(device)
+    
     # Load VGG for perceptual loss with frozen parameters
     vgg = vgg19(pretrained=True).features[:36].eval().to(device)
     for param in vgg.parameters():
@@ -1525,6 +1546,23 @@ def train_unknown_srgan(use_synthetic=False, use_wandb=False, verbose=True,
         adversarial_weight = 0.001 + progress_ratio * 0.002  # Even lower adversarial weight
         # Optional LPIPS weight - reduced to prevent over-texturing
         lpips_weight = 0.03 if use_lpips else 0.0
+        
+        # Progressive loss weights - optimized for clearer images with fewer artifacts
+        progress_ratio = min(epoch / (num_epochs * 0.5), 1.0)  # Faster transition to perceptual losses
+        
+        # Content loss weight - maintain high weight for pixel accuracy
+        content_weight = 1.0
+        
+        # Perceptual weight - gradually increase to enhance details
+        # Start lower and increase more significantly later in training
+        perceptual_weight = 0.1 + 0.5 * progress_ratio
+        
+        # Adversarial weight - very careful increase to avoid artifacts
+        # Start extremely low and increase slowly
+        adversarial_weight = 0.0001 + progress_ratio * 0.001
+        
+        # LPIPS weight - for additional perceptual quality if available
+        lpips_weight = 0.05 * progress_ratio if use_lpips else 0.0
         
         # Create a progress bar for better visibility
         progress_bar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
