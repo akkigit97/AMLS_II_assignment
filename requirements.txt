@@ -9,3 +9,10 @@ matplotlib
 scikit-learn
 scikit-image
 fire
+seaborn
+tqdm
+lpips
+wandb
+tensorboard>=2.10.0  # Alternative to wandb
+opencv-python>=4.6.0  # For advanced image processing
+psutil>=5.9.0
