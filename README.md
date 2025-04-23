@@ -1,6 +1,6 @@
 # Super-Resolution GAN (SRGAN) Implementation
 
-This repository contains two implementations of SRGAN (Super-Resolution Generative Adversarial Network) for image super-resolution tasks:
+This repository contains two implementations of SRGAN (Super-Resolution Generative Adversarial Network) for image super-resolution tasks for NITRE 2017 Challenge:
 
 1. `Track 1.py`: Enhanced SRGAN for standard super-resolution with known degradation patterns - bicubic (Track 1)
 2. `Track 2.py`: Specialized SRGAN for unknown degradation super-resolution (Track 2)
