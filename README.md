@@ -11,7 +11,7 @@ This repository contains two implementations of SRGAN (Super-Resolution Generati
 Install the required packages:
 
 ```bash
-pip install torch torchvision lpips wandb scikit-image matplotlib
+pip install torch torchvision lpips wandb scikit-image matplotlib resource numpy pandas
 ```
 
 ### Dataset
