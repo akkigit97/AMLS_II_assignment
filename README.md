@@ -44,10 +44,10 @@ Each task script can be run directly:
 
 ```bash
 # Task1: Standard super-resolution
-python "Track1.py"
+python Track1.py
 
 # Task2: Unknown degradation super-resolution
-python "Track2.py" --use_wandb
+python Track2.py --use_wandb
 ```
 
 ### Command Line Arguments (Track2)
