@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Main.py for SRGAN tasks.
-This script invokes Track 1.py for Track1 Bicubic and Track 2.py for Track2 unknown degradation.
+This script invokes Track1.py for Track1 Bicubic and Track2.py for Track2 unknown degradation.
 """
 
 import argparse
@@ -13,9 +13,9 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='Main orchestrator for SRGAN tasks.')
     parser.add_argument(
-        '--task1', action='store_true', help='Run SRGAN Track1 training (Track 1.py)')
+        '--task1', action='store_true', help='Run SRGAN Track1 training (Track1.py)')
     parser.add_argument(
-        '--task2', action='store_true', help='Run SRGAN Track2 training (Track 2.py)')
+        '--task2', action='store_true', help='Run SRGAN Track2 training (Track2.py)')
     parser.add_argument(
         '--use_synthetic', action='store_true', help='Use synthetic data (affects Track2)')
     parser.add_argument(
@@ -34,7 +34,7 @@ def parse_args():
 
 
 def run_task1():
-    cmd = [sys.executable, 'Track 1.py']
+    cmd = [sys.executable, 'Track1.py']
     print(f"Running Track1: {' '.join(cmd)}")
     result = subprocess.run(cmd)
     if result.returncode != 0:
@@ -43,7 +43,7 @@ def run_task1():
 
 
 def run_task2(args):
-    cmd = [sys.executable, 'Track 2.py']
+    cmd = [sys.executable, 'Track2.py']
     if args.use_synthetic:
         cmd.append('--use_synthetic')
     if args.use_wandb:
@@ -81,4 +81,4 @@ def main():
 
 
 if __name__ == '__main__':
-main()
+    main()
