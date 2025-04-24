@@ -692,16 +692,36 @@ class CBAM(nn.Module):
         x = x * self.spatial_attention(x)
         return x
 
+class PixelNorm(nn.Module):
+    def __init__(self, epsilon=1e-8):
+        super(PixelNorm, self).__init__()
+        self.epsilon = epsilon
+
+    def forward(self, x):
+        # Normalize each pixel vector across channels
+        norm = torch.sqrt(torch.mean(x ** 2, dim=1, keepdim=True) + self.epsilon)
+        return x / norm
+
 class ImprovedResidualBlock(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, channels, norm_type='batch'):
         super(ImprovedResidualBlock, self).__init__()
-        
-        # Simplified block with batch normalization for stability
+        # Simplified block with flexible normalization
+        self.norm_type = norm_type
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm2d(channels)
-        self.activation = nn.ReLU(inplace=True)  # Use ReLU instead of PReLU for stability
+        if norm_type == 'instance':
+            self.norm1 = nn.InstanceNorm2d(channels, affine=True)
+        elif norm_type == 'pixel':
+            self.norm1 = PixelNorm()
+        else:
+            self.norm1 = nn.BatchNorm2d(channels)
+        self.activation = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(channels)
+        if norm_type == 'instance':
+            self.norm2 = nn.InstanceNorm2d(channels, affine=True)
+        elif norm_type == 'pixel':
+            self.norm2 = PixelNorm()
+        else:
+            self.norm2 = nn.BatchNorm2d(channels)
         
         # Initialize with small values
         self._initialize_weights()
@@ -714,11 +734,11 @@ class ImprovedResidualBlock(nn.Module):
         
     def forward(self, x):
         out = self.conv1(x)
-        out = self.bn1(out)
+        out = self.norm1(out)
         out = self.activation(out)
         
         out = self.conv2(out)
-        out = self.bn2(out)
+        out = self.norm2(out)
         
         # Explicitly avoid in-place addition to prevent numerical issues
         return out
@@ -839,8 +859,10 @@ class RDB(nn.Module):
         return x + out * self.local_beta
 
 class ImprovedGenerator(nn.Module):
-    def __init__(self, in_channels=3, out_channels=3, num_channels=64, num_blocks=16, upscale_factor=4):
+    def __init__(self, in_channels=3, out_channels=3, num_channels=64, num_blocks=16, upscale_factor=4, norm_type='batch'):
         super(ImprovedGenerator, self).__init__()
+        # Store normalization type for residual blocks
+        self.norm_type = norm_type
         
         # Use a more stable architecture with fewer blocks for initial training
         num_blocks = min(num_blocks, 8)  # Limit block count to reduce complexity initially
@@ -849,9 +871,9 @@ class ImprovedGenerator(nn.Module):
         # Initial convolution block with lower channel count
         self.conv_input = nn.Conv2d(in_channels, num_channels, kernel_size=3, stride=1, padding=1)
         
-        # Residual blocks with activation scaling
+        # Residual blocks with configurable normalization
         self.residual_blocks = nn.ModuleList([
-            ImprovedResidualBlock(num_channels) for _ in range(num_blocks)
+            ImprovedResidualBlock(num_channels, norm_type=norm_type) for _ in range(num_blocks)
         ])
         
         # Skip connection with batch norm for stability
@@ -1045,6 +1067,12 @@ class VGGLoss(nn.Module):
         sr = (sr + 1.0) / 2.0
         hr = (hr + 1.0) / 2.0
         
+        # Add ImageNet mean/std normalization
+        mean = torch.tensor([0.485, 0.456, 0.406], device=sr.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=sr.device).view(1, 3, 1, 1)
+        sr = (sr - mean) / std
+        hr = (hr - mean) / std
+        
         # Extract features
         sr_features = self.features(sr)
         hr_features = self.features(hr)
@@ -1165,10 +1193,10 @@ def save_example_images(model, dataset, device, save_dir=None, num_images=5):
                     from torchvision.transforms.functional import resize
                     sr_img = resize(lr_img, size=[hr_img.shape[2], hr_img.shape[3]])
                 
-                # Denormalize images (convert from [-1,1] to [0,1])
-                lr_img = (lr_img.squeeze(0).cpu() * 0.5 + 0.5).clamp(0, 1)
-                sr_img = (sr_img.squeeze(0).cpu() * 0.5 + 0.5).clamp(0, 1)
-                hr_img = (hr_img.squeeze(0).cpu() * 0.5 + 0.5).clamp(0, 1)
+                # Denormalize images (convert from [-1,1] to [0,1]) using helper
+                lr_img = inverse_normalize(lr_img.squeeze(0)).cpu().clamp(0, 1)
+                sr_img = inverse_normalize(sr_img.squeeze(0)).cpu().clamp(0, 1)
+                hr_img = inverse_normalize(hr_img.squeeze(0)).cpu().clamp(0, 1)
                 
                 # Convert to numpy arrays in HWC format
                 lr_np = lr_img.permute(1, 2, 0).numpy()
@@ -1285,17 +1313,17 @@ def save_compact_comparison(model, dataset, device, save_dir="compact_comparison
                 except Exception as e:
                     print(f"Error calculating metrics: {e}")
                 
-                # Denormalize images (convert from [-1,1] to [0,1])
-                lr_img = (lr_img.squeeze(0).cpu() * 0.5 + 0.5).clamp(0, 1)
-                sr_img = (sr_img.squeeze(0).cpu() * 0.5 + 0.5).clamp(0, 1)
-                hr_img = (hr_img.squeeze(0).cpu() * 0.5 + 0.5).clamp(0, 1)
+                # Denormalize images using helper
+                lr_img = inverse_normalize(lr_img.squeeze(0)).cpu().clamp(0, 1)
+                sr_img = inverse_normalize(sr_img.squeeze(0)).cpu().clamp(0, 1)
+                hr_img = inverse_normalize(hr_img.squeeze(0)).cpu().clamp(0, 1)
                 
                 # Convert to numpy arrays in HWC format
                 lr_np = lr_img.permute(1, 2, 0).numpy()
                 sr_np = sr_img.permute(1, 2, 0).numpy()
                 hr_np = hr_img.permute(1, 2, 0).numpy()
                 
-                # Debug info
+                # Debug info on shapes
                 print(f"Image shapes - LR: {lr_np.shape}, SR: {sr_np.shape}, HR: {hr_np.shape}")
                 
                 # Scale LR image to HR size for display
@@ -1344,7 +1372,7 @@ def create_dir(dir_path):
 def train_unknown_srgan(use_synthetic=False, use_wandb=False, verbose=True,
                        batch_size=16, num_epochs=200, save_every=1,
                        lr_gen=1e-4, lr_disc=1e-4,
-                       patch_size=24, device='cuda'):
+                       patch_size=24, device='cuda', norm_type='batch'):
     """
     Train SRGAN with mixed precision and memory optimizations.
     """
@@ -1437,11 +1465,11 @@ def train_unknown_srgan(use_synthetic=False, use_wandb=False, verbose=True,
     # ... existing code ...
     
     # Initialize models
-    generator = ImprovedGenerator(in_channels=3, out_channels=3, num_channels=64, num_blocks=16, upscale_factor=4).to(device)
+    generator = ImprovedGenerator(in_channels=3, out_channels=3, num_channels=64, num_blocks=16, upscale_factor=4, norm_type=norm_type).to(device)
     discriminator = ImprovedDiscriminator(input_shape=(3, 96, 96)).to(device)
     
     # Initialize models with proper initialization
-    generator = ImprovedGenerator(in_channels=3, out_channels=3, num_channels=64, num_blocks=16, upscale_factor=4).to(device)
+    generator = ImprovedGenerator(in_channels=3, out_channels=3, num_channels=64, num_blocks=16, upscale_factor=4, norm_type=norm_type).to(device)
     # Apply improved weight initialization to generator
     for m in generator.modules():
         if isinstance(m, nn.Conv2d):
@@ -2551,6 +2579,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr_path', type=str, help='Custom path to LR images directory')
     parser.add_argument('--hr_path', type=str, help='Custom path to HR images directory')
     parser.add_argument('--list_dir', action='store_true', help='List available DIV2K directories')
+    parser.add_argument('--norm_type', type=str, choices=['batch','instance','pixel'], default='batch', help='Normalization type for residual blocks')
     args = parser.parse_args()
     
     # Generate notebook if requested
@@ -2606,7 +2635,7 @@ if __name__ == "__main__":
             sys.exit(1)
         
         # Start training
-        train_unknown_srgan(use_synthetic=args.use_synthetic, use_wandb=args.use_wandb)
+        train_unknown_srgan(use_synthetic=args.use_synthetic, use_wandb=args.use_wandb, norm_type=args.norm_type)
         
         # Load the best model for evaluation
         try:
