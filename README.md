@@ -29,10 +29,10 @@ This repository includes a top-level script `main.py` that will invoke both Trac
 python main.py
 
 # Run only the Track1 script (Track 1.py)
-python main.py --task1
+python main.py --Track1
 
 # Run only the Track2 script with SRGAN-Track2 options
-python main.py --task2 [--use_synthetic] [--use_wandb] [--download_dataset] [--generate_notebook] [--lr_path LR_DIR] [--hr_path HR_DIR]
+python main.py --Track2 [--use_synthetic] [--use_wandb] [--download_dataset] [--generate_notebook] [--lr_path LR_DIR] [--hr_path HR_DIR]
 
 # View help for all options
 tools: python main.py --help
@@ -44,10 +44,10 @@ Each task script can be run directly:
 
 ```bash
 # Task1: Standard super-resolution
-python "Track 1.py"
+python "Track1.py"
 
 # Task2: Unknown degradation super-resolution
-python "Track 2.py" --use_wandb
+python "Track2.py" --use_wandb
 ```
 
 ### Command Line Arguments (Track2)
