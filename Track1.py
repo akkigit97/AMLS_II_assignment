@@ -38,8 +38,8 @@ def init_wandb(project_name="SRGAN", config=None):
             "epochs": 100,
             "scale_factor": 4,
             "content_weight": 1.0,
-            "perceptual_weight": 0.1,
-            "adversarial_weight": 1e-4,
+            "perceptual_weight": 0.05,
+            "adversarial_weight": 5e-4,
             "lpips_weight": 0.1
         }
         
@@ -477,10 +477,10 @@ def verify_dataset(use_synthetic=False):
         print("   - DIV2K_valid_LR_bicubic_X4.zip")
         print("\n3. Create a directory structure as follows:")
         print("   DIV2K/")
-        print("   ├── DIV2K_train_HR/")
-        print("   ├── DIV2K_train_LR_bicubic_X4/DIV2K_train_LR_bicubic/X4/")
-        print("   ├── DIV2K_valid_HR/DIV2K_valid_HR/")
-        print("   └── DIV2K_valid_LR_bicubic_X4/DIV2K_valid_LR_bicubic/X4/")
+        print("   +-- DIV2K_train_HR/")
+        print("   +-- DIV2K_train_LR_bicubic_X4/DIV2K_train_LR_bicubic/X4/")
+        print("   +-- DIV2K_valid_HR/DIV2K_valid_HR/")
+        print("   +-- DIV2K_valid_LR_bicubic_X4/DIV2K_valid_LR_bicubic/X4/")
         print("\n4. Place the DIV2K directory in one of the following locations:")
         for dir_path in data_dirs:
             print(f"   - {dir_path}")
@@ -579,11 +579,11 @@ class PairedBicubicDataset(Dataset):
                     # Fix the issue by ensuring HR is exactly 4x the size of LR
                     hr_img = hr_img.resize((lr_width * 4, lr_height * 4), Image.BICUBIC)
                 
-        except Exception as e:
-            print(f"Error loading images at index {idx}: {e}")
-            # Return a default small image in case of error
-            lr_img = Image.new("RGB", (64, 64), color=(0, 0, 0))
-            hr_img = Image.new("RGB", (256, 256), color=(0, 0, 0))
+            except Exception as e:
+                print(f"Error loading images at index {idx}: {e}")
+                # Return a default small image in case of error
+                lr_img = Image.new("RGB", (64, 64), color=(0, 0, 0))
+                hr_img = Image.new("RGB", (256, 256), color=(0, 0, 0))
         
         # Apply transforms
         if self.hr_transform:
@@ -688,7 +688,7 @@ class ResidualDenseBlock(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-        
+                    
     def forward(self, x):
         x1 = self.lrelu(self.conv1(x))
         x2 = self.lrelu(self.conv2(torch.cat([x, x1], 1)))
@@ -758,8 +758,8 @@ class ImprovedGenerator(nn.Module):
         for _ in range(2):  # Upscale by factor of 4 (2^2)
             upsampling.extend([
                 nn.Conv2d(base_channels, base_channels * 4, kernel_size=3, stride=1, padding=1),
-            nn.PixelShuffle(2),
-            nn.PReLU()
+                nn.PixelShuffle(2),
+                nn.PReLU()
             ])
         self.upsampling = nn.Sequential(*upsampling)
         
@@ -953,7 +953,7 @@ def save_example_images(model, dataset, device, save_dir=None, num_images=5):
         num_images = len(dataset)
     
     # Process a batch of images
-        with torch.no_grad():
+    with torch.no_grad():
         for i in range(num_images):
             lr_img, hr_img = dataset[i]
             
@@ -985,7 +985,7 @@ def save_example_images(model, dataset, device, save_dir=None, num_images=5):
             plt.imshow(lr_display)
             plt.axis('off')
             plt.title("LR (Bicubic Upscale)")
-        plt.tight_layout()
+            plt.tight_layout()
             plt.savefig(os.path.join(save_dir, f"sample_{i+1}_LR.png"), dpi=300)
             plt.close()
             
@@ -1051,7 +1051,7 @@ class VGGLoss(nn.Module):
             # Freeze parameters
             for param in vgg.parameters():
                 param.requires_grad = False
-                
+            
             # Define layer indices for feature extraction
             # Using deeper layers for more semantic features
             self.slice1 = nn.Sequential(*list(vgg.children())[:3])  # conv1_2
@@ -1641,14 +1641,14 @@ def train_srgan_track1(use_synthetic=False):
     num_epochs = 100
     gradient_accumulation_steps = 4
     best_val_loss = float('inf')
-    early_stopping_patience = 15
+    early_stopping_patience = 25
     no_improve_epochs = 0
     checkpoint_every = 5  # Save checkpoint every 5 epochs
     
     # Modified loss weights for better stability
     content_weight = 1.0
-    perceptual_weight = 0.1  # Reduced for stability
-    adversarial_weight = 1e-4  # Reduced for stability
+    perceptual_weight = 0.05  # Reduced for stability
+    adversarial_weight = 5e-4  # Reduced for stability
     lpips_weight = 0.1
     
     # Learning rate warmup
@@ -1726,7 +1726,7 @@ def train_srgan_track1(use_synthetic=False):
     # Use smaller batch sizes to reduce memory usage and disable workers
     try:
         print("Creating data loaders...")
-        batch_size = 4  # Reduced batch size to reduce memory pressure
+        batch_size = 16  # Reduced batch size to reduce memory pressure
         # Use persistent_workers=False and num_workers=0 to avoid file handle issues
         train_loader = DataLoader(
             train_dataset, 
@@ -1973,45 +1973,45 @@ def train_srgan_track1(use_synthetic=False):
                 
                 try:
                     sr_imgs = generator(lr_imgs)
-                
-                # Calculate validation loss
-                val_loss = content_loss_fn(sr_imgs, hr_imgs).item()
-                cumulative_val_loss += val_loss
-                
-                # Calculate metrics
-                val_psnr = calculate_psnr(sr_imgs, hr_imgs)
-                cumulative_val_psnr += val_psnr
-                
-                # Calculate SSIM with proper window size and error handling
-                try:
-                    sr_np = (sr_imgs.cpu().numpy().squeeze() * 0.5 + 0.5).clip(0, 1)
-                    hr_np = (hr_imgs.cpu().numpy().squeeze() * 0.5 + 0.5).clip(0, 1)
                     
-                    # Ensure images are at least 7x7 for SSIM calculation
-                    min_dim = min(sr_np.shape[1], sr_np.shape[2])
-                    win_size = min(7, min_dim) if min_dim % 2 == 1 else min(7, min_dim - 1)
+                    # Calculate validation loss
+                    val_loss = content_loss_fn(sr_imgs, hr_imgs).item()
+                    cumulative_val_loss += val_loss
                     
+                    # Calculate metrics
+                    val_psnr = calculate_psnr(sr_imgs, hr_imgs)
+                    cumulative_val_psnr += val_psnr
+                    
+                    # Calculate SSIM with proper window size and error handling
+                    try:
+                        sr_np = (sr_imgs.cpu().numpy().squeeze() * 0.5 + 0.5).clip(0, 1)
+                        hr_np = (hr_imgs.cpu().numpy().squeeze() * 0.5 + 0.5).clip(0, 1)
+                        
+                        # Ensure images are at least 7x7 for SSIM calculation
+                        min_dim = min(sr_np.shape[1], sr_np.shape[2])
+                        win_size = min(7, min_dim) if min_dim % 2 == 1 else min(7, min_dim - 1)
+                        
                         ssim_value = calculate_ssim(sr_np, hr_np)
-                    cumulative_val_ssim += ssim_value
+                        cumulative_val_ssim += ssim_value
                         
                         # Free numpy arrays
                         del sr_np, hr_np
                         
-                except Exception as e:
-                    print(f"Error calculating SSIM: {e}")
-                    ssim_value = 0.0
-                    cumulative_val_ssim += ssim_value
-                
-                # Calculate LPIPS
-                try:
-                    lpips_value = lpips_loss_fn(sr_imgs, hr_imgs).mean().item()
-                    cumulative_val_lpips += lpips_value
-                except Exception as e:
-                    print(f"Error calculating LPIPS: {e}")
-                    lpips_value = 0.0
-                    cumulative_val_lpips += lpips_value
-                
-                val_batches += 1
+                    except Exception as e:
+                        print(f"Error calculating SSIM: {e}")
+                        ssim_value = 0.0
+                        cumulative_val_ssim += ssim_value
+                    
+                    # Calculate LPIPS
+                    try:
+                        lpips_value = lpips_loss_fn(sr_imgs, hr_imgs).mean().item()
+                        cumulative_val_lpips += lpips_value
+                    except Exception as e:
+                        print(f"Error calculating LPIPS: {e}")
+                        lpips_value = 0.0
+                        cumulative_val_lpips += lpips_value
+                    
+                    val_batches += 1
                     
                 except Exception as e:
                     print(f"Error during validation: {e}")
@@ -2771,7 +2771,7 @@ if __name__ == "__main__":
             lr_transform=lr_transform,
             hr_transform=hr_transform
         )
-        valid_loader = DataLoader(valid_dataset, batch_size=1, shuffle=False)
+        valid_loader = DataLoader(valid_dataset, batch_size=8, shuffle=False)
         
         # Create a test loader with the training data to have more samples
         test_dataset = PairedBicubicDataset(
@@ -2780,7 +2780,7 @@ if __name__ == "__main__":
             lr_transform=lr_transform,
             hr_transform=hr_transform
         )
-        test_loader = DataLoader(test_dataset, batch_size=1, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=8, shuffle=True)
         
         # Log some images without training
         print("Logging samples to wandb...")
